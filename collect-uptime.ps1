@@ -6,6 +6,28 @@ param (
 
 $OutputFile = Join-Path -Path $OutputDirectory -ChildPath $OutputFileName
 
+function Test-WMIPort {
+    param([string]$ComputerName)
+    
+    try {
+        $tcpClient = New-Object Net.Sockets.TcpClient
+        $result = $tcpClient.BeginConnect($ComputerName, 135, $null, $null)
+        $success = $result.AsyncWaitHandle.WaitOne(3000) # 3 second timeout
+        if ($success) {
+            $tcpClient.EndConnect($result)
+            $tcpClient.Close()
+            return $true
+        }
+        else {
+            $tcpClient.Close()
+            return $false
+        }
+    }
+    catch {
+        return $false
+    }
+}
+
 function Get-ServerUptime {
     param([string]$ComputerName)
     
@@ -14,6 +36,12 @@ function Get-ServerUptime {
         Uptime = $null
         Method = $null
         Error = $null
+    }
+    
+    # Проверяем доступность порта WMI перед попыткой подключения
+    if (-not (Test-WMIPort -ComputerName $ComputerName)) {
+        $result.Error = "WMI port (135) not accessible"
+        return $result
     }
     
     try {
@@ -70,6 +98,7 @@ function Get-ServerUptime {
     
     return $result
 }
+
 
 if (-not (Test-Path -Path $OutputDirectory)) {
     try {
