@@ -169,7 +169,6 @@ function Get-ServerUptime {
     return $result
 }
 
-# Создаем директории если их нет
 if (-not (Test-Path -Path $OutputDirectory)) {
     try {
         New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
@@ -181,7 +180,6 @@ if (-not (Test-Path -Path $OutputDirectory)) {
     }
 }
 
-# Очищаем старые логи (оставляем только за последние 7 дней)
 try {
     Get-ChildItem -Path $OutputDirectory -Filter "Uptime_Script_*.log" | 
         Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } | 
@@ -191,7 +189,6 @@ catch {}
 
 Write-Log "=== Uptime Check Script started ===" -Level "INFO"
 
-# Получаем список серверов
 if ($ComputerList) {
     Write-Log "Using manual computer list" -Level "INFO"
     $servers = $ComputerList | ForEach-Object {
@@ -208,8 +205,7 @@ elseif (-not $SkipADSearch) {
         Write-Log "ActiveDirectory module loaded successfully" -Level "SUCCESS"
         
         Write-Log "Search for computers in AD..." -Level "INFO"
-        
-        # Пробуем разные OU на случай если структура отличается
+
         $searchBases = @(
             "OU=Servers,DC=domain,DC=com",
             "OU=Windows Servers,DC=domain,DC=com",
@@ -233,8 +229,7 @@ elseif (-not $SkipADSearch) {
                 Write-Log "Cannot search in $searchBase: $_" -Level "WARNING"
             }
         }
-        
-        # Убираем дубликаты
+
         $servers = $allServers | Sort-Object Name -Unique
         
         Write-Log "Total unique servers found: $($servers.Count)" -Level "INFO"
@@ -255,20 +250,28 @@ else {
     exit 0
 }
 
-# Основной цикл проверки
+param (
+    [switch]$VerboseLogging
+)
+
 $results = @()
 $onlineCount = 0
 $offlineCount = 0
 $errorCount = 0
 $totalServers = $servers.Count
 $currentServer = 0
+$scriptStart = Get-Date
 
 Write-Log "Starting server availability check..." -Level "INFO"
 Write-Log "Servers to check: $totalServers" -Level "INFO"
 Write-Log "Ping timeout: ${PingTimeout}ms" -Level "INFO"
 Write-Log "------------------------------------" -Level "INFO"
 
-# Используем ForEach-Object -Parallel если поддерживается (PowerShell 7+)
+if (-not (Test-Path -Path $OutputDirectory -PathType Container)) {
+    New-Item -Path $OutputDirectory -ItemType Directory -Force | Out-Null
+    Write-Log "Created output directory: $OutputDirectory" -Level "INFO"
+}
+
 if ($PSVersionTable.PSVersion.Major -ge 7 -and $totalServers -gt 10) {
     Write-Log "Using parallel processing (PowerShell 7+)" -Level "INFO"
     
@@ -276,13 +279,11 @@ if ($PSVersionTable.PSVersion.Major -ge 7 -and $totalServers -gt 10) {
         $serverObj = $_
         $server = $serverObj.Name
         $osType = $serverObj.OperatingSystem
-        
-        # Импортируем функции в параллельный runspace
         $function:Test-ServerOnline = $using:function:Test-ServerOnline
         $function:Test-WMIPort = $using:function:Test-WMIPort
         $function:Get-ServerUptime = $using:function:Get-ServerUptime
-        
-        $online = Test-ServerOnline -ComputerName $server
+
+        $online = Test-ServerOnline -ComputerName $server -Timeout 5000
         $result = [PSCustomObject]@{
             ServerName    = $server
             Status        = "Checking"
@@ -295,13 +296,27 @@ if ($PSVersionTable.PSVersion.Major -ge 7 -and $totalServers -gt 10) {
         }
         
         if ($online) {
-            $uptimeInfo = Get-ServerUptime -ComputerName $server
-            
+            try {
+                $uptimeInfo = Get-ServerUptime -ComputerName $server -Timeout 10000
+            }
+            catch {
+                $uptimeInfo = [PSCustomObject]@{
+                    Uptime      = $null
+                    LastBootTime = $null
+                    Method      = "Error"
+                    Error       = $_.Exception.Message
+                    Online      = $false
+                }
+                Write-Log "$server : WMI/RPC error: $($_.Exception.Message)" -Level "WARNING"
+            }
+
             if ($uptimeInfo.Uptime) {
                 $uptimeString = "{0}d {1}h {2}m" -f $uptimeInfo.Uptime.Days, $uptimeInfo.Uptime.Hours, $uptimeInfo.Uptime.Minutes
                 $result.Status = "Online"
                 $result.Uptime = $uptimeString
-                $result.LastBootTime = if ($uptimeInfo.LastBootTime) { $uptimeInfo.LastBootTime.ToString("yyyy-MM-dd HH:mm:ss") } else { "N/A" }
+                $result.LastBootTime = if ($uptimeInfo.LastBootTime) { 
+                    $uptimeInfo.LastBootTime.ToString("yyyy-MM-dd HH:mm:ss")
+                } else { "N/A" }
                 $result.Method = $uptimeInfo.Method
                 
                 Write-Host "$server : Online (Uptime: $uptimeString via $($uptimeInfo.Method))" -ForegroundColor Green
@@ -317,52 +332,60 @@ if ($PSVersionTable.PSVersion.Major -ge 7 -and $totalServers -gt 10) {
         }
         
         $result
-    } -ThrottleLimit 10  # Ограничиваем параллельные процессы
-    
-    # Пересчитываем статистику
+    } -ThrottleLimit 10
     $onlineCount = ($results | Where-Object { $_.Status -eq "Online" }).Count
     $offlineCount = ($results | Where-Object { $_.Status -eq "Offline" }).Count
     $errorCount = ($results | Where-Object { $_.Status -notin @("Online", "Offline") }).Count
-    
 }
 else {
-    # Последовательная обработка (для PowerShell 5.1)
     foreach ($serverObj in $servers) {
         $currentServer++
         $server = $serverObj.Name
         $osType = $serverObj.OperatingSystem
-        
-        Write-Progress -Activity "Checking servers" -Status "Processing $server ($currentServer of $totalServers)" -PercentComplete (($currentServer / $totalServers) * 100)
-        
+
+        $percent = [math]::Round(($currentServer / $totalServers) * 100, 0)
+        $elapsed = (Get-Date) - $scriptStart
+        $avgTimePerServer = $elapsed.TotalSeconds / $currentServer
+        $estimatedTotal = $avgTimePerServer * $totalServers
+        $estimatedEnd = (Get-Date).AddSeconds($estimatedTotal - $elapsed.TotalSeconds)
+
+        Write-Progress -Activity "Checking servers" `
+            -Status "Processing $server ($currentServer of $totalServers) – $percent% – ETA: $($estimatedEnd.ToString('HH:mm:ss'))" `
+            -PercentComplete $percent
+
         Write-Host "[$currentServer/$totalServers] Checking server: $server" -ForegroundColor Gray
-        
-        $online = Test-ServerOnline -ComputerName $server
-        
-        if ($online) {
-            $uptimeInfo = Get-ServerUptime -ComputerName $server
-            
-            if ($uptimeInfo.Uptime) {
-                $uptimeString = "{0}d {1}h {2}m" -f $uptimeInfo.Uptime.Days, $uptimeInfo.Uptime.Hours, $uptimeInfo.Uptime.Minutes
-                $status = "Online"
-                $onlineCount++
-                $method = $uptimeInfo.Method
-                
-                Write-Log "$server : Online (Uptime: $uptimeString via $method)" -Level "SUCCESS"
+
+        $online = Test-ServerOnline -ComputerName $server -Timeout 5000
+
+        try { 
+            $uptimeInfo = Get-ServerUptime -ComputerName $server -Timeout 10000
+        }
+        catch {
+            $uptimeInfo = [PSCustomObject]@{
+                Uptime      = $null
+                LastBootTime = $null
+                Method      = "Error"
+                Error       = $_.Exception.Message
+                Online      = $false
             }
-            else {
-                $status = if ($uptimeInfo.Online) { "Access Denied" } else { "Offline" }
-                $uptimeString = "N/A"
-                $method = "N/A"
-                $errorCount++
-                
-                Write-Log "$server : $status ($($uptimeInfo.Error))" -Level "WARNING"
-            }
-            
-            $lastBootTime = if ($uptimeInfo.LastBootTime) { 
-                $uptimeInfo.LastBootTime.ToString("yyyy-MM-dd HH:mm:ss") 
-            } else { 
-                "N/A" 
-            }
+            Write-Log "$server : WMI/RPC error: $($_.Exception.Message)" -Level "WARNING"
+        }
+
+        if ($online -and $uptimeInfo.Uptime) {
+            $uptimeString = "{0}d {1}h {2}m" -f $uptimeInfo.Uptime.Days, $uptimeInfo.Uptime.Hours, $uptimeInfo.Uptime.Minutes
+            $status = "Online"
+            $onlineCount++
+            $method = $uptimeInfo.Method
+
+            Write-Log "$server : Online (Uptime: $uptimeString via $method)" -Level "SUCCESS"
+        }
+        elseif ($online) {
+            $status = if ($uptimeInfo.Online) { "Access Denied" } else { "Offline" }
+            $uptimeString = "N/A"
+            $method = "N/A"
+            $errorCount++
+
+            Write-Log "$server : $status ($($uptimeInfo.Error))" -Level "WARNING"
         }
         else {
             $status = "Offline"
@@ -370,10 +393,16 @@ else {
             $lastBootTime = "N/A"
             $method = "N/A"
             $offlineCount++
-            
+
             Write-Log "$server : Offline" -Level "ERROR"
         }
-        
+
+        $lastBootTime = if ($uptimeInfo.LastBootTime) {
+            $uptimeInfo.LastBootTime.ToString("yyyy-MM-dd HH:mm:ss")
+        } else {
+            "N/A"
+        }
+
         $results += [PSCustomObject]@{
             ServerName    = $server
             Status        = $status
@@ -388,49 +417,6 @@ else {
     Write-Progress -Activity "Checking servers" -Completed
 }
 
-# Выводим итоги
 Write-Log "------------------------------------" -Level "INFO"
 Write-Log "Check completed. Summary:" -Level "INFO"
-Write-Log "Total servers: $totalServers" -Level "INFO"
-Write-Log "Online: $onlineCount" -Level "SUCCESS"
-Write-Log "Offline: $offlineCount" -Level "ERROR"
-Write-Log "With errors: $errorCount" -Level "WARNING"
-
-# Сохраняем результаты
-try {
-    $results | Sort-Object Status, ServerName | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8 -Delimiter ";"
-    Write-Log "The report was successfully saved: $OutputFile" -Level "SUCCESS"
-    
-    # Создаем краткий отчет
-    $summaryFile = Join-Path -Path $OutputDirectory -ChildPath "Uptime_Summary_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
-    @"
-UPTIME CHECK REPORT
-Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-Total Servers: $totalServers
-Online: $onlineCount
-Offline: $offlineCount
-Errors: $errorCount
-
-TOP 10 LONGEST UPTIME:
-$($results | Where-Object { $_.Status -eq 'Online' } | Sort-Object @{E={[timespan]$_.Uptime -replace '[^0-9:\.]'}} -Descending | Select-Object -First 10 | ForEach-Object { "  $($_.ServerName): $($_.Uptime)" } | Out-String)
-
-OFFLINE SERVERS:
-$($results | Where-Object { $_.Status -eq 'Offline' } | Select-Object -ExpandProperty ServerName | ForEach-Object { "  $_" } | Out-String)
-"@ | Out-File -FilePath $summaryFile -Encoding UTF8
-    
-    Write-Log "Summary saved: $summaryFile" -Level "SUCCESS"
-    
-    # Показываем таблицу
-    $results | Format-Table ServerName, Status, Uptime, Method -AutoSize
-    
-    # Предлагаем открыть папку
-    if ((Read-Host "Open report directory? (Y/N)") -eq "Y") {
-        Invoke-Item -Path $OutputDirectory
-    }
-}
-catch {
-    Write-Log "Error saving report: $_" -Level "ERROR"
-    Write-Log "Check file permissions and disk space" -Level "WARNING"
-}
-
-Write-Log "=== Script execution completed ===" -Level "INFO"
+Write-Log "Total servers: $totalServers" -Level "INFO
