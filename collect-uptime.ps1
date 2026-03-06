@@ -103,54 +103,72 @@ function Test-ServerOnline {
 }
 
 function Get-ServerUptime {
-    param([string]$ComputerName)
-    
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ComputerName
+    )
+
     $result = @{
+        ComputerName = $ComputerName
         LastBootTime = $null
         Uptime = $null
         Method = $null
         Error = $null
         Online = $false
     }
-    
+
     # Проверяем доступность сервера
-    if (-not (Test-ServerOnline -ComputerName $ComputerName)) {
+    if (-not (Test-Connection -ComputerName $ComputerName -Count 1 -Quiet)) {
         $result.Error = "Server not responding"
         return $result
     }
-    
+
     $result.Online = $true
-    
-    # Проверяем доступность порта WMI
-    if (-not (Test-WMIPort -ComputerName $ComputerName)) {
-        $result.Error = "WMI port (135) not accessible"
-        return $result
-    }
-    
+
     # Пробуем разные методы по порядку предпочтения
     $methods = @(
-        @{Name = "CIM"; Script = {
-            $os = Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $ComputerName -ErrorAction Stop
-            $os.LastBootUpTime
-        }},
-        @{Name = "WMI"; Script = {
-            $os = Get-WmiObject -Class Win32_OperatingSystem -ComputerName $ComputerName -ErrorAction Stop
-            $os.ConvertToDateTime($os.LastBootUpTime)
-        }},
-        @{Name = "SystemInfo"; Script = {
-            $sysinfo = systeminfo /s $ComputerName 2>$null | Select-String "System Boot Time"
-            if ($sysinfo) {
-                $bootTimeString = ($sysinfo -split ":", 2)[1].Trim()
-                [DateTime]::Parse($bootTimeString)
+        @{
+            Name = "CIM"
+            Script = {
+                Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $ComputerName -ErrorAction Stop
             }
-            else { throw "No boot time info" }
-        }}
+        },
+        @{
+            Name = "WMI"
+            Script = {
+                Get-WmiObject -Class Win32_OperatingSystem -ComputerName $ComputerName -ErrorAction Stop
+            }
+        },
+        @{
+            Name = "SystemInfo"
+            Script = {
+                $sysinfo = systeminfo /s $ComputerName 2>$null | Select-String "System Boot Time"
+                if ($sysinfo) {
+                    $bootTimeString = ($sysinfo -split ":", 2)[1].Trim()
+                    [DateTime]::Parse($bootTimeString)
+                }
+                else { throw "No boot time info" }
+            }
+        }
     )
-    
+
     foreach ($method in $methods) {
         try {
-            $lastBootTime = & $method.Script
-            if ($lastBootTime) {
+            $os = & $method.Script
+            switch ($method.Name) {
+                "CIM" {
+                    $lastBootTime = $os.LastBootUpTime
+                }
+                "WMI" {
+                    $lastBootTime = $os.ConvertToDateTime($os.LastBootUpTime)
+                }
+                "SystemInfo" {
+                    $lastBootTime = $os
+                }
+            }
+
+            if ($lastBootTime -and $lastBootTime -is [DateTime]) {
                 $result.LastBootTime = $lastBootTime
                 $result.Uptime = (Get-Date) - $lastBootTime
                 $result.Method = $method.Name
@@ -158,34 +176,45 @@ function Get-ServerUptime {
             }
         }
         catch {
-            $result.Error = if ($result.Error) { 
-                "$($result.Error) | $($method.Name): $($_.Exception.Message)"
+            $errorMessage = "$($method.Name): $($_.Exception.Message)"
+            $result.Error = if ($result.Error) {
+                "$($result.Error) | $errorMessage"
             } else {
-                "$($method.Name): $($_.Exception.Message)"
+                $errorMessage
             }
         }
     }
-    
+
     return $result
 }
 
-if (-not (Test-Path -Path $OutputDirectory)) {
+function Clean-OldLogs {
+    param(
+        [string]$OutputDirectory,
+        [int]$DaysToKeep = 7
+    )
+
+    if (-not (Test-Path -Path $OutputDirectory)) {
+        try {
+            New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+            Write-Log "Directory created: $OutputDirectory" -Level "SUCCESS"
+        }
+        catch {
+            Write-Log "Error creating directory: $_" -Level "ERROR"
+            exit 1
+        }
+    }
+
     try {
-        New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
-        Write-Log "Directory created: $OutputDirectory" -Level "SUCCESS"
+        Get-ChildItem -Path $OutputDirectory -Filter "Uptime_Script_*.log" |
+            Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$DaysToKeep) } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
     }
     catch {
-        Write-Log "Error creating directory: $_" -Level "ERROR"
-        exit 1
+        Write-Log "Error cleaning old logs: $_" -Level "ERROR"
     }
 }
 
-try {
-    Get-ChildItem -Path $OutputDirectory -Filter "Uptime_Script_*.log" | 
-        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } | 
-        Remove-Item -Force -ErrorAction SilentlyContinue
-}
-catch {}
 
 Write-Log "=== Uptime Check Script started ===" -Level "INFO"
 
