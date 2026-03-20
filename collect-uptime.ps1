@@ -47,31 +47,35 @@ function Write-Log {
 }
 
 function Test-WMIPort {
-    param([string]$ComputerName)
-    
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ComputerName
+    )
+
+    $tcpClient = $null
+
     try {
-        $tcpClient = New-Object Net.Sockets.TcpClient
+        $tcpClient = New-Object System.Net.Sockets.TcpClient
         $result = $tcpClient.BeginConnect($ComputerName, 135, $null, $null)
-        $success = $result.AsyncWaitHandle.WaitOne(2000) # Уменьшили до 2 секунд
+        $success = $result.AsyncWaitHandle.WaitOne(2000)
+
         if ($success) {
             $tcpClient.EndConnect($result)
-            $tcpClient.Close()
             return $true
         }
-        else {
-            $tcpClient.Close()
-            return $false
-        }
+
+        return $false
     }
     catch {
         return $false
     }
     finally {
-        if ($tcpClient -ne $null) {
+        if ($tcpClient -is [System.IDisposable]) {
             $tcpClient.Dispose()
         }
     }
 }
+
 
 function Test-ServerOnline {
     param([string]$ComputerName)
